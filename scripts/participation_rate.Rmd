@@ -1,0 +1,296 @@
+---
+title: "Erasmus+ Participation vs GDP - Basic Country Statistics"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+options(max.print = 75)
+
+library(tidyr)
+library(scales)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(lme4)
+library(ggplot2)
+library(stringr)
+library(MuMIn)
+library(sf)
+library(tmap)
+library(spdep)
+library(mapview)
+library(purrr)
+library(cartogram)
+library(spatialreg)
+
+# Base directories (align with other scripts)
+proj_dir <- "your-path"
+data_dir <- proj_dir
+out_dir  <- file.path(proj_dir, "output")
+
+```
+
+## 1. Erasmus+ data (country–year participation)
+
+```{r erasmus-data}
+data <- read_rds(file.path(data_dir, "erasmus_combined.rds"))
+
+# Drop first column if it is an index
+data <- data[, -1]
+
+data <- data %>%
+  rename(
+    sending_city     = `Sending City`,
+    receiving_city   = `Receiving City`,
+    sending_country  = `Sending Country`,
+    receiving_country = `Receiving Country`
+  ) %>%
+  mutate(
+    send_code = str_extract(sending_country,  "^[A-Z]{2}"),
+    recv_code = str_extract(receiving_country, "^[A-Z]{2}")
+  )
+
+# European analysis universe 
+europe_codes <- c(
+  "AL","AT","BE","BG","CH","CY","CZ","DE","DK","EE","ES","FI",
+  "FR","GR","HR","HU","IE","IS","IT","LI","LT","LU","LV","MT",
+  "NL","NO","PL","PT","RO","SE","SI","SK","TR","UK","ME","MK",
+  "RS","UA","MD","XK"
+)
+
+data <- data %>%
+  filter(
+    send_code %in% europe_codes,
+    recv_code %in% europe_codes,
+    send_code != recv_code
+  )
+
+cat(sprintf("Rows after European filter: %d\n", nrow(data)))
+```
+
+## 2. GDP and population data 
+
+We load GDP and population files and build a country–year panel.
+
+```{r gdp-data}
+gdp_data <- readRDS(file.path(data_dir, "gdp_data.rds"))
+gdp_data <- gdp_data %>%
+  rename(
+    country   = geo,
+    year      = TIME_PERIOD,
+    gdp_value = OBS_VALUE
+  )
+```
+
+```{r pop-data}
+pop_data <- read_tsv(file.path(data_dir, "pop_count_.tsv"))
+
+# First column contains flags + country code, e.g. "A,NR,TOTAL,T,AT"
+names(pop_data)[1] <- c('country')
+
+pop_data <- pop_data %>%
+  filter(str_detect(country,"A,NR,TOTAL,T"))
+pop_data$country <- str_remove(pop_data$country,"A,NR,TOTAL,T,")
+
+pop_data <- pop_data[, c(1, 56:64)]
+```
+
+```{r pop-long}
+pop_data_long <- pop_data %>%
+  pivot_longer(
+    cols      = `2014`:`2022`,
+    names_to  = "year",
+    values_to = "population"
+  ) %>%
+  mutate(year = as.numeric(year))
+```
+
+```{r merge-pop-gdp}
+add_df <- pop_data_long %>%
+  inner_join(gdp_data, by = c("country", "year"))
+
+# Check coverage
+print(sort(unique(add_df$year)))
+```
+
+## 3. Restrict to Erasmus countries and clean numeric fields
+
+```{r filter-to-erasmus}
+# Countries actually appearing in Erasmus flows (send or receive)
+erasmus_countries <- data %>%
+  pivot_longer(cols = c(send_code, recv_code),
+               names_to = "type",
+               values_to = "country") %>%
+  distinct(country) %>%
+  pull(country)
+
+add_df <- add_df %>%
+  filter(country %in% erasmus_countries)
+
+# Keep only digits, comma, dot; then convert to numeric
+add_df$gdp_value  <- gsub("[^0-9.,]", "", add_df$gdp_value)
+add_df$population <- gsub("[^0-9.,]", "", add_df$population)
+
+add_df$gdp_value  <- as.numeric(add_df$gdp_value)
+add_df$population <- as.numeric(add_df$population)
+
+summary(add_df$gdp_value)
+summary(add_df$population)
+```
+
+```{r manual-fix}
+# Manual correction for two missing population values 
+# These numbers correspond to specific (country, year) entries inspected beforehand.
+add_df$population[340:341] <- c(1793000, 1745000)
+
+# Simple GDP-per-capita proxy (GDP / population * 100 for nicer magnitudes)
+add_df$norm_gdp_val <- round((add_df$gdp_value / add_df$population) * 100, 2)
+
+summary(add_df$norm_gdp_val)
+```
+
+## 4. Build country–year participation table
+
+We aggregate Erasmus sends by country and year and attach population and GDP.
+
+```{r df-country}
+# Rename for join
+names(add_df) <- c("send_code", "year", "population", "gdp_value", "norm_gdp_val")
+
+# Erasmus participants sent per country-year
+df_country <- data %>%
+  count(send_code, year, name = "n_participants")
+
+# Unique population/GDP per (send_code, year)
+df_pop <- add_df %>%
+  distinct(send_code, year, population, gdp_value, norm_gdp_val)
+
+df_country <- df_country %>%
+  inner_join(df_pop, by = c("send_code", "year"))
+
+# For convenience
+df_country <- df_country %>%
+  rename(CNTR_ID = send_code)
+
+glimpse(df_country)
+```
+
+```{r participation-and-gdp}
+# Participants per population
+df_country$participation_rate <- ((df_country$n_participants /df_country$population)*100)
+```
+
+```{r}
+# Add geospatial data
+polygon_data <- st_read('country_borders.gpkg')
+df_country$CNTR_ID <- str_split_fixed(df_country$CNTR_ID, " ", 2)[,1]
+
+geo_data <- polygon_data %>% 
+  inner_join(df_country, by=c("CNTR_ID"))
+```
+
+## 5. Plot the raw participation rates
+
+```{r}
+# plotting the raw participation rate for EU countries between the years 2019-2022
+geo_data[geo_data$year %in% c("2019","2020","2021","2022"), ] %>%
+  tm_shape() +
+  tm_facets(by = "year") +
+  tm_polygons(
+    fill = "participation_rate",
+    palette = c("#F67451", "#E6D460", "#00E078", "#73E7D8"),
+    title = "Participation frequency"
+  ) +
+  tm_layout(
+    legend.outside = TRUE,
+    legend.outside.position = "bottom"
+  ) +
+  tm_tiles()
+
+# Plotting proportional participation map
+df_carto_all <- geo_data %>%
+  split(.$year) %>%
+  map(~ cartogram_cont(.x, weight = "participation_rate", itermax = 5)) %>%
+  bind_rows()
+
+ggplot(df_carto_all) +
+  geom_sf(aes(fill = participation_rate)) +
+  facet_wrap(~ year) +
+  scale_fill_gradientn(
+    colours = c("#064789", "#8CD790", "#FCFDBF", "#FE9F6D", "#DE4968"),
+    values = scales::rescale(c(0, 0.25, 0.5, 0.75, 1))
+  ) +
+  labs(title="Proportional share of participation in Erasmus+", fill="share of participants")+
+  theme_minimal()
+```
+
+## 7. Analyse the autocorelation
+
+```{r}
+# Calculate the queen contiguity neighbourhoods
+nb <- poly2nb(geo_data, queen = TRUE)
+country_nb <- st_coordinates(st_centroid(geo_data$geom))
+
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Moran test for GDP and participation rate with Monte-Carlo simulation
+moran.mc(geo_data$participation_rate, 
+           lw,
+           nsim = 999,
+           zero.policy = TRUE)
+moran.mc(geo_data$norm_gdp_val, 
+           lw,
+           nsim = 999,
+           zero.policy = TRUE)
+```
+
+```{r}
+# Calculte univ LISA clusters for participation rate and the bv LISA clusters for participation and GDP
+lisa_participation <- localmoran(geo_data$participation_rate,lw,
+            na.action=na.fail,
+        conditional=TRUE, alternative = "two.sided", mlvar=TRUE,
+        spChk=NULL, adjust.x=FALSE, zero.policy=attr(lw, "zero.policy"))
+
+bv_lisa_participation_GDP <- localmoran_bv(geo_data$participation_rate, geo_data$norm_gdp_val,
+           lw,nsim = 499, scale = TRUE, alternative="two.sided",
+ iseed=1L, no_repeat_in_row=FALSE, zero.policy=attr(lw, "zero.policy"))
+```
+
+## 8. Plot LISA clusters
+
+```{r}
+# Plotting univ LISA clusters for participation rate and the bv LISA clusters for participation and GDP
+geo_data$lisa_uni_cluster <- attr(lisa_participation, "quadr")[,'pysal']
+geo_data$lisa_bv_cluster <- attr(bv_lisa_participation_GDP, "quadr")[,'pysal']
+
+# univ LISA
+tm_shape(geo_data)+
+  tm_polygons("lisa_uni_cluster",
+              palette = c("#064789", "#8CD790", "#FE9F6D", "#DE4968"),
+              title = "LISA Clusters") +
+  tm_layout(frame = FALSE)
+# bv LISA
+tm_shape(geo_data)+
+  tm_polygons("lisa_bv_cluster",
+              palette = c("#064789", "#8CD790", "#FE9F6D", "#DE4968"),
+              title = "LISA Clusters") +
+  tm_layout(frame = FALSE)
+```
+
+## 9. Build spatial models 
+
+```{r}
+# apply the SLX model to the data
+GDP_participation_model01 <- lmSLX(participation_rate ~ norm_gdp_val + year, data = geo_data, listw = lw)
+summary(GDP_participation_model01)
+```
+
+```{r}
+# apply the OLS and the SEM model to the data
+GDP_participation_model02 <- errorsarlm(participation_rate ~ norm_gdp_val + year, data = geo_data, listw = lw)
+summary(GDP_participation_model02)
+```
+
