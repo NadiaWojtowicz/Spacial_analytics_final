@@ -1,0 +1,380 @@
+---
+title: "Erasmus+ Country-Level Mobility Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(sf)
+library(scales)
+library(readr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(viridis)
+
+# Base directories 
+proj_dir <- "your-path"
+data_dir <- proj_dir
+out_dir  <- file.path(proj_dir, "output")
+
+```
+
+## 1. Load raw Erasmus data
+
+This script constructs a *country‑level* corridor dataset and runs all
+models/aggregates used in the paper (H1 and H2). 
+
+```{r load-data}
+# Raw mobility data (one row per student)
+erasmus_raw <- read_rds(file.path(data_dir, "erasmus_combined.rds"))
+
+glimpse(head(erasmus_raw))
+```
+
+## 2. ISO codes and European analysis universe
+
+We restrict to corridors where both sending and receiving countries are in the
+European Erasmus+ programme/partner set and exclude within‑country moves.
+
+```{r iso-europe-filter}
+erasmus_raw <- erasmus_raw %>%
+  rename(
+    sending_city      = `Sending City`,
+    receiving_city    = `Receiving City`,
+    sending_country   = `Sending Country`,
+    receiving_country = `Receiving Country`
+  ) %>%
+  mutate(
+    send_code = str_extract(sending_country,   "^[A-Z]{2}"),
+    recv_code = str_extract(receiving_country, "^[A-Z]{2}")
+  )
+
+# European analysis universe
+europe_codes <- c(
+  "AL","AT","BE","BG","CH","CY","CZ","DE","DK","EE","ES","FI",
+  "FR","GR","HR","HU","IE","IS","IT","LI","LT","LU","LV","MT",
+  "NL","NO","PL","PT","RO","SE","SI","SK","TR","UK","ME","MK",
+  "RS","UA","MD","XK"
+)
+
+erasmus_raw <- erasmus_raw %>%
+  filter(
+    send_code %in% europe_codes,
+    recv_code %in% europe_codes,
+    send_code != recv_code
+  )
+
+```
+
+## 2b. Population data (Eurostat-style, by country-year)
+
+We read population and reshape to a country–year panel.
+
+```{r population-data}
+## 2b. Population data (Eurostat-style, by country-year)
+
+pop_raw <- read_tsv(file.path(data_dir, "pop_count_.tsv"))
+
+# First column: flags + country code, e.g. "A,NR,TOTAL,T,AT"
+names(pop_raw)[1] <- "country_raw"
+
+pop_long <- pop_raw %>%
+  # Keep total population series
+  filter(str_detect(country_raw, "A,NR,TOTAL,T")) %>%
+  mutate(country = str_remove(country_raw, "A,NR,TOTAL,T,")) %>%
+  select(country, `2014`:`2022`) %>%
+  pivot_longer(
+    cols      = `2014`:`2022`,
+    names_to  = "year",
+    values_to = "population"
+  ) %>%
+  mutate(
+    year = as.numeric(year),
+    # Strip flags and non-numeric chars, then convert
+    population = gsub("[^0-9.,]", "", population),
+    population = as.numeric(population)
+  )
+
+# Restrict to Erasmus years actually in the data
+years_erasmus <- sort(unique(erasmus_raw$year))
+pop_long <- pop_long %>%
+  filter(year %in% years_erasmus)
+
+# Restrict to our European universe
+pop_long <- pop_long %>%
+  filter(country %in% europe_codes)
+
+cat("Population panel summary:\n")
+summary(pop_long$population)
+```
+
+## 3. Country–country–year flows
+
+```{r flows-country}
+# Directed country–country–year flows
+flows_country_raw <- erasmus_raw %>%
+  count(send_code, recv_code, year, name = "n_students")
+
+cat(sprintf("Country–country–year rows: %d\n", nrow(flows_country_raw)))
+summary(flows_country_raw$n_students)
+```
+
+## 4. Country centroids, distances, and population attachment
+
+We attach WGS84 centroids from Natural Earth, compute centroid‑to‑centroid
+distances in km, and join sending/receiving population.
+
+```{r centroids-distance}
+# World countries
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Harmonise problematic codes (e.g. GB → UK, -99 → iso_a2_eh)
+world_sf <- world_sf %>%
+  mutate(
+    iso_a2 = if_else(iso_a2 == "-99", iso_a2_eh, iso_a2),
+    iso_a2 = if_else(iso_a2 == "GB",  "UK", iso_a2)
+  )
+
+# Centroid coordinates
+world_centroids <- world_sf %>%
+  st_centroid() %>%
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(iso_a2, lon, lat)
+
+# Attach centroids to both ends of each corridor
+flows_country_dist <- flows_country_raw %>%
+  left_join(world_centroids, by = c("send_code" = "iso_a2")) %>%
+  rename(lon_from = lon, lat_from = lat) %>%
+  left_join(world_centroids, by = c("recv_code" = "iso_a2")) %>%
+  rename(lon_to = lon, lat_to = lat) %>%
+  filter(!is.na(lon_from), !is.na(lon_to))
+
+cat(sprintf("Rows with both centroids: %d\n", nrow(flows_country_dist)))
+
+# Great-circle distance (km)
+sf_from <- st_as_sf(flows_country_dist,
+                    coords = c("lon_from", "lat_from"), crs = 4326)
+sf_to   <- st_as_sf(flows_country_dist,
+                    coords = c("lon_to", "lat_to"), crs = 4326)
+
+flows_country_dist$distance_km <- as.numeric(
+  st_distance(sf_from, sf_to, by_element = TRUE)
+) / 1000
+
+summary(flows_country_dist$distance_km)
+```
+
+```{r attach-population}
+# Attach population for sending and receiving countries (by ISO2 and year)
+flows_country_dist <- flows_country_dist %>%
+  left_join(pop_long, by = c("send_code" = "country", "year")) %>%
+  rename(pop_sending = population) %>%
+  left_join(pop_long, by = c("recv_code" = "country", "year")) %>%
+  rename(pop_receiving = population)
+
+cat("Population (sending) summary:\n")
+summary(flows_country_dist$pop_sending)
+cat("Population (receiving) summary:\n")
+summary(flows_country_dist$pop_receiving)
+```
+
+## 5. Build corridor dataset and COVID periods
+
+This is the main dataset for gravity models and COVID analysis.
+
+```{r corridors-build}
+corridors <- flows_country_dist %>%
+  filter(
+    !is.na(distance_km),
+    !is.na(pop_sending), !is.na(pop_receiving),
+    pop_sending > 0, pop_receiving > 0
+  ) %>%
+  mutate(
+    log_n_students    = log(n_students),
+    log_distance      = log(distance_km),
+    log_pop_sending   = log(pop_sending),
+    log_pop_receiving = log(pop_receiving),
+    period = case_when(
+      year %in% 2017:2019 ~ "pre_covid",
+      year %in% 2020:2021 ~ "covid",
+      year >= 2022        ~ "post_covid",
+      TRUE                ~ "early"
+    )
+  )
+
+```
+
+## 6. Gravity models for H1 (distance and population)
+
+We estimate:
+
+- M1a: log–log gravity model with distance only.  
+- M1b: distance + sending/receiving population (H1b).  
+- M1c: distance + population + year fixed effects.
+
+```{r gravity-models}
+# M1a: distance only
+m1a <- lm(log_n_students ~ log_distance, data = corridors)
+
+# M1b: distance + sending/receiving population
+m1b <- lm(log_n_students ~ log_distance + log_pop_sending + log_pop_receiving,
+          data = corridors)
+
+# M1c: distance + population + year FE
+m1c <- lm(log_n_students ~ log_distance + log_pop_sending + log_pop_receiving +
+            factor(year),
+          data = corridors)
+
+model_list   <- list(m1a, m1b, m1c)
+model_labels <- c("M1a: distance only",
+                  "M1b: + population",
+                  "M1c: + population + year FE")
+
+for (i in seq_along(model_list)) {
+  m  <- model_list[[i]]
+  se <- sqrt(diag(vcov(m)))
+  cat(sprintf(
+    "\n%s\n  Distance coef: %.3f (SE = %.3f) | Adj.R² = %.3f\n",
+    model_labels[i],
+    coef(m)["log_distance"],
+    se["log_distance"],
+    summary(m)$adj.r.squared
+  ))
+}
+
+summary(m1c)
+```
+
+## 7. Peripheral senders vs core (H1c)
+
+We test whether selected geographically peripheral senders tend to have longer
+corridor distances.
+
+```{r periphery-model}
+# Theory-driven periphery definition
+periphery <- c("IS","IE","CY","PT","FI","NO","SE","MT")
+
+corridors <- corridors %>%
+  mutate(peripheral_sender = send_code %in% periphery)
+
+m_periph <- lm(distance_km ~ peripheral_sender + factor(year), data = corridors)
+
+summary(m_periph)
+```
+
+## 8. COVID disruption (H2a–H2c)
+
+### 8.1 Total flows by period (H2a)
+
+```{r total-by-period}
+total_by_period <- corridors %>%
+  group_by(period) %>%
+  summarise(
+    total_flows = sum(n_students),
+    mean_dist   = mean(distance_km),
+    .groups     = "drop"
+  )
+
+total_by_period
+
+# Simple log-linear comparison of periods (COVID as reference)
+m_period <- lm(log(total_flows) ~ period, data = total_by_period)
+summary(m_period)
+```
+
+### 8.2 Distance bands by period (H2b)
+
+```{r distance-bands}
+corridors_distcat <- corridors %>%
+  mutate(
+    dist_cat = case_when(
+      distance_km <= 1000 ~ "short",
+      distance_km <= 2500 ~ "medium",
+      TRUE                ~ "long"
+    )
+  )
+
+flows_by_period_dist <- corridors_distcat %>%
+  group_by(period, dist_cat) %>%
+  summarise(total = sum(n_students), .groups = "drop") %>%
+  group_by(period) %>%
+  mutate(share = total / sum(total)) %>%
+  ungroup()
+
+flows_by_period_dist
+```
+
+```{r plot-distance-bands}
+p_bands <- ggplot(flows_by_period_dist,
+                  aes(x = period, y = share, fill = dist_cat)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_viridis_d(name = "Distance band") +
+  theme_minimal() +
+  labs(
+    title = "Share of flows by distance band and period",
+    x     = NULL,
+    y     = "Share of flows"
+  )
+
+p_bands
+
+ggsave(file.path(out_dir, "erasmus_flows_distance_bands_period.png"),
+       plot = p_bands, dpi = 300, width = 8, height = 5)
+```
+
+### 8.3 Top‑10 corridor concentration by period (H2c)
+
+```{r top10-share}
+top10_share <- corridors %>%
+  group_by(period, send_code, recv_code) %>%
+  summarise(n = sum(n_students), .groups = "drop") %>%
+  group_by(period) %>%
+  mutate(rank = rank(-n, ties.method = "first")) %>%
+  summarise(
+    total_all   = sum(n),
+    top10_total = sum(n[rank <= 10]),
+    top10_share = top10_total / total_all,
+    .groups     = "drop"
+  )
+
+top10_share
+```
+
+```{r plot-top10-share}
+p_top10 <- ggplot(top10_share, aes(x = period, y = top10_share)) +
+  geom_line(group = 1, colour = "#d7191c") +
+  geom_point(size = 3, colour = "#d7191c") +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, NA)
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Top‑10 corridor share of total flows by period",
+    x     = NULL,
+    y     = "Share of total flows"
+  )
+
+p_top10
+
+ggsave(file.path(out_dir, "erasmus_top10_share_period.png"),
+       plot = p_top10, dpi = 300, width = 8, height = 5)
+```
+

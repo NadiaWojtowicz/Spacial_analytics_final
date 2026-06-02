@@ -1,0 +1,63 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-04-23"
+---
+
+```{r}
+
+library(data.table)
+library(readxl)
+library(stringr)
+
+# 1. Find files 
+files <- list.files(
+  path      = "indicate-your-path",
+  pattern   = "^Erasmus-KA1-Mobility-Data-\\d{4}\\.xlsx$",
+  full.names = TRUE
+)
+
+cat("Files found:", length(files), "\n")
+print(basename(files))
+
+# 2. Preview column names
+lapply(files, function(f) {
+  cat("\n---", basename(f), "---\n")
+  print(colnames(read_excel(f, n_max = 0)))
+})
+
+# 3. Read function
+cols_needed <- c("Fewer Opportunities", "Sending Country", "Sending City",
+                 "Receiving Country", "Receiving City")
+
+read_erasmus <- function(f) {
+  year <- as.integer(str_extract(basename(f), "\\d{4}"))
+  df   <- read_excel(f, na = c("", "-"), col_types = "text")  # read all as text
+  setDT(df)
+  df <- df[, ..cols_needed]
+  df[, year := year]
+  df
+}
+
+erasmus <- rbindlist(
+  lapply(files, read_erasmus),
+  use.names = TRUE,
+  fill      = TRUE
+)
+
+# Clean broken city names (Unicode replacement character)
+broken_sending   <- unique(erasmus$`Sending City`[grepl("\uFFFD",   erasmus$`Sending City`)])
+broken_receiving <- unique(erasmus$`Receiving City`[grepl("\uFFFD", erasmus$`Receiving City`)])
+#broken city names
+print(sort(unique(c(broken_sending, broken_receiving))))
+
+erasmus <- erasmus[
+  !grepl("\uFFFD", `Sending City`)   &
+  !grepl("\uFFFD", `Receiving City`)
+]
+
+#save the data
+saveRDS(erasmus, "erasmus_combined.rds")
+```
+
+
