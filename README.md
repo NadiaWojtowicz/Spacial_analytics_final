@@ -1,1 +1,1 @@
-# Spacial_analytics_final
+# Spatial_analytics_final
